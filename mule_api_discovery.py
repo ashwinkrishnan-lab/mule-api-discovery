@@ -623,9 +623,26 @@ class ExchangeDiscovery:
         return None
     
     def get_asset_documentation(self, group_id: str, asset_id: str, version: str) -> List[Dict]:
+        """Fetches documentation pages and their content."""
         url = f"{self.config.exchange_url}/assets/{group_id}/{asset_id}/{version}/pages"
-        result = self.client.get(url)
-        return result if isinstance(result, list) else []
+        pages = self.client.get(url)
+        if not pages or not isinstance(pages, list):
+            return []
+        
+        # Fetch content for each page
+        for page in pages:
+            page_path = page.get("pagePath", "")
+            if page_path:
+                content = self._get_page_content(group_id, asset_id, version, page_path)
+                if content:
+                    page["content"] = content
+        
+        return pages
+    
+    def _get_page_content(self, group_id: str, asset_id: str, version: str, page_path: str) -> Optional[str]:
+        """Fetches the content of a specific documentation page."""
+        url = f"{self.config.exchange_url}/assets/{group_id}/{asset_id}/{version}/pages/{page_path}"
+        return self.client.get_text(url)
     
     def get_asset_dependencies(self, group_id: str, asset_id: str, version: str) -> Dict:
         deps_url = f"{self.config.exchange_url}/assets/{group_id}/{asset_id}/{version}/dependencies"
