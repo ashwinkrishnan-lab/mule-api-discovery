@@ -421,7 +421,7 @@ class AnypointClient:
                         self.stats["total_wait_time"] += wait_time
                         continue
                     else:
-                        logger.error(f"❌ Rate limit exceeded after {self.rate_config.max_retries} retries")
+                        logger.error(f"❌ Rate limit exceeded after {self.rate_config.max_retries} retries: {url}")
                         self.stats["failed_requests"] += 1
                         return None
                 
@@ -433,6 +433,18 @@ class AnypointClient:
                         self.stats["retries"] += 1
                         continue
                 
+                # Log non-success responses for debugging (except 404 which is expected for some endpoints)
+                if response.status_code == 403:
+                    logger.debug(f"🔒 Access denied (403): {url} - Check Connected App scopes")
+                    self.stats["failed_requests"] += 1
+                    self._track_permission_error(url)
+                    return None
+                
+                if response.status_code == 404:
+                    # 404 is often expected (e.g., no spec file exists)
+                    self.stats["successful_requests"] += 1
+                    return None
+                
                 response.raise_for_status()
                 self.stats["successful_requests"] += 1
                 
@@ -440,20 +452,41 @@ class AnypointClient:
                     return response.json()
                 return {}
                 
-            except requests.exceptions.HTTPError:
+            except requests.exceptions.HTTPError as e:
                 self.stats["failed_requests"] += 1
+                if hasattr(e, 'response') and e.response is not None:
+                    logger.debug(f"HTTP error {e.response.status_code}: {url}")
                 return None
             except requests.exceptions.Timeout:
                 if retry < self.rate_config.max_retries:
                     self.stats["retries"] += 1
+                    logger.warning(f"⚠️  Timeout on {url}. Retry {retry + 1}...")
                     continue
                 self.stats["failed_requests"] += 1
+                logger.warning(f"❌ Timeout after {self.rate_config.max_retries} retries: {url}")
                 return None
-            except Exception:
+            except Exception as e:
                 self.stats["failed_requests"] += 1
+                logger.debug(f"Request error: {url} - {e}")
                 return None
         
         return None
+    
+    def _track_permission_error(self, url: str) -> None:
+        """Track 403 errors to report scope issues at the end."""
+        if "permission_errors" not in self.stats:
+            self.stats["permission_errors"] = set()
+        # Extract the API type from the URL for summary
+        if "/apimanager/" in url:
+            self.stats["permission_errors"].add("API Manager")
+        elif "/exchange/" in url:
+            self.stats["permission_errors"].add("Exchange")
+        elif "/visualizer/" in url:
+            self.stats["permission_errors"].add("Visualizer")
+        elif "/cloudhub/" in url or "/amc/" in url:
+            self.stats["permission_errors"].add("Runtime Manager")
+        elif "/hybrid/" in url:
+            self.stats["permission_errors"].add("Runtime Manager (Hybrid)")
     
     def get_text(self, url: str) -> Optional[str]:
         """Make GET request and return text response."""
@@ -472,6 +505,17 @@ class AnypointClient:
                         time.sleep(wait_time)
                         self.stats["retries"] += 1
                         continue
+                    return None
+                
+                if response.status_code == 403:
+                    logger.debug(f"🔒 Access denied (403): {url}")
+                    self._track_permission_error(url)
+                    self.stats["failed_requests"] += 1
+                    return None
+                
+                if response.status_code == 404:
+                    # 404 is expected when spec/doc doesn't exist
+                    self.stats["successful_requests"] += 1
                     return None
                 
                 response.raise_for_status()
@@ -493,6 +537,14 @@ class AnypointClient:
         print(f"  Failed: {self.stats['failed_requests']}")
         print(f"  Retries: {self.stats['retries']}")
         print(f"  Total wait time: {self.stats['total_wait_time']:.1f}s")
+        
+        # Report permission issues
+        if self.stats.get("permission_errors"):
+            print(f"\n⚠️  Permission Issues Detected (403 Forbidden):")
+            print(f"   The Connected App may be missing scopes for:")
+            for api in sorted(self.stats["permission_errors"]):
+                print(f"     - {api}")
+            print(f"   See CUSTOMER_SETUP.md for required scopes.")
 
 
 # =============================================================================
@@ -1152,6 +1204,44 @@ class MuleSoftAPIDiscovery:
             print(f"  Sandbox Graph: {len(self.output.sandbox_graph.nodes)} nodes, {len(self.output.sandbox_graph.edges)} edges")
         if self.output.production_graph:
             print(f"  Production Graph: {len(self.output.production_graph.nodes)} nodes, {len(self.output.production_graph.edges)} edges")
+        
+        # Data completeness check
+        self._print_data_completeness()
+    
+    def _print_data_completeness(self) -> None:
+        """Print data completeness diagnostics."""
+        api_types = ['rest-api', 'http-api', 'raml', 'raml-fragment', 'oas']
+        api_assets = [a for a in self.output.exchange_assets if a.asset_type in api_types]
+        
+        if not api_assets:
+            return
+        
+        with_specs = sum(1 for a in api_assets if a.specification)
+        with_docs = sum(1 for a in api_assets if a.documentation_pages)
+        with_files = sum(1 for a in api_assets if a.files)
+        with_deps = sum(1 for a in self.output.exchange_assets if a.dependencies or a.dependents)
+        
+        print(f"\n📋 Data Completeness for API Assets ({len(api_assets)} APIs):")
+        print(f"  With specifications: {with_specs}/{len(api_assets)}")
+        print(f"  With documentation: {with_docs}/{len(api_assets)}")
+        print(f"  With file listings: {with_files}/{len(api_assets)}")
+        print(f"  With dependencies: {with_deps}/{len(self.output.exchange_assets)}")
+        
+        # Potential issues
+        issues = []
+        if len(api_assets) > 0 and with_specs == 0:
+            issues.append("No specs found - APIs may be proxies without embedded specs, or /api/spec endpoint returned 404")
+        if len(api_assets) > 0 and with_docs == 0:
+            issues.append("No documentation found - docs may not be published, or /pages endpoint inaccessible")
+        if len(self.output.applications) > 0 and len(self.output.api_instances) == 0:
+            issues.append("No API instances despite having apps - API Manager scope may be missing")
+        if len(self.output.environments) > 0 and not self.output.sandbox_graph and not self.output.production_graph:
+            issues.append("No Visualizer data - Visualizer scope may be missing or not enabled")
+        
+        if issues:
+            print(f"\n⚠️  Potential Data Gaps:")
+            for issue in issues:
+                print(f"    • {issue}")
     
     def save_output(self, output_dir: str = "discovery_output") -> Dict[str, str]:
         """Save discovery output to files."""
