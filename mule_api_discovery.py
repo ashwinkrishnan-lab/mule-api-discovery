@@ -273,6 +273,9 @@ class DiscoveryOutput:
     exchange_assets: List[ExchangeAsset] = field(default_factory=list)
     assets_by_type: Dict[str, int] = field(default_factory=dict)
     api_instances: List[DeployedAPIInstance] = field(default_factory=list)
+    # Track access issues for reporting
+    access_denied_business_groups: List[str] = field(default_factory=list)
+    access_denied_environments: List[str] = field(default_factory=list)
 
 
 # =============================================================================
@@ -641,9 +644,10 @@ class ExchangeDiscovery:
     def __init__(self, client: AnypointClient):
         self.client = client
         self.config = client.config
+        self.access_denied_orgs: List[str] = []  # Track orgs with 403 errors
     
     def get_all_assets(self, org_id: str, limit: int = 500) -> List[Dict]:
-        logger.info("Fetching assets from Exchange...")
+        """Fetch assets from a single org."""
         all_assets = []
         offset = 0
         page_size = 100
@@ -653,7 +657,8 @@ class ExchangeDiscovery:
                    f"?organizationId={org_id}&offset={offset}&limit={page_size}"
                    f"&includeSnapshots=false")
             result = self.client.get(url)
-            if not result:
+            if result is None:
+                # Could be 403 - check if tracked
                 break
             assets = result if isinstance(result, list) else result.get("assets", [])
             if not assets:
@@ -663,8 +668,44 @@ class ExchangeDiscovery:
                 break
             offset += page_size
         
-        logger.info(f"  Found {len(all_assets)} Exchange assets")
         return all_assets
+    
+    def get_all_assets_from_all_orgs(self, organizations: List[Dict], limit_per_org: int = 500) -> Tuple[List[Dict], List[str]]:
+        """
+        Fetch Exchange assets from all business groups.
+        Returns: (all_assets, list_of_orgs_with_access_denied)
+        """
+        logger.info("Fetching assets from Exchange across all business groups...")
+        all_assets = []
+        access_denied_orgs = []
+        
+        for org in organizations:
+            org_id = org.get("org_id") or org.get("id", "")
+            org_name = org.get("org_name") or org.get("name", org_id[:8])
+            
+            # Try to fetch assets from this org
+            url = f"{self.config.exchange_url}/assets?organizationId={org_id}&offset=0&limit=1"
+            test_result = self.client.get(url)
+            
+            if test_result is None:
+                # Check if this was a permission error
+                if self.client.stats.get("permission_errors") and "Exchange" in self.client.stats.get("permission_errors", set()):
+                    access_denied_orgs.append(org_name)
+                    logger.warning(f"  ⚠️  Access denied for business group: {org_name}")
+                    continue
+            
+            # Fetch all assets from this org
+            org_assets = self.get_all_assets(org_id, limit_per_org)
+            if org_assets:
+                logger.info(f"  📁 {org_name}: {len(org_assets)} assets")
+                all_assets.extend(org_assets)
+            else:
+                logger.info(f"  📁 {org_name}: 0 assets")
+        
+        logger.info(f"  Total: {len(all_assets)} Exchange assets across {len(organizations) - len(access_denied_orgs)} accessible business groups")
+        
+        self.access_denied_orgs = access_denied_orgs
+        return all_assets, access_denied_orgs
     
     def get_asset_details(self, group_id: str, asset_id: str, version: str) -> Optional[Dict]:
         url = f"{self.config.exchange_url}/assets/{group_id}/{asset_id}/{version}"
@@ -731,10 +772,13 @@ class APIManagerDiscovery:
         self.client = client
         self.config = client.config
     
-    def get_api_instances(self, org_id: str, env_id: str) -> List[Dict]:
+    def get_api_instances(self, org_id: str, env_id: str) -> Optional[List[Dict]]:
+        """Get API instances. Returns None if access denied, empty list if no instances."""
         url = f"{self.config.api_manager_url}/organizations/{org_id}/environments/{env_id}/apis"
         result = self.client.get(url)
-        return result.get("apis", []) if result else []
+        if result is None:
+            return None  # Access denied or error
+        return result.get("apis", [])
     
     def get_api_policies(self, org_id: str, env_id: str, api_id: str) -> List[Dict]:
         url = f"{self.config.api_manager_url}/organizations/{org_id}/environments/{env_id}/apis/{api_id}/policies"
@@ -945,10 +989,14 @@ class MuleSoftAPIDiscovery:
         logger.info(f"  Found {len(self.output.environments)} environments")
         
         # 3. Get deployed applications
+        access_denied_envs = []
         if include_runtime:
             logger.info("\n🔄 Fetching deployed applications...")
             for env in all_environments:
                 logger.info(f"  Environment: {env.env_name} ({env.env_type})")
+                
+                # Track permission errors before making calls
+                errors_before = len(self.client.stats.get("permission_errors", set()))
                 
                 # CloudHub 1.0
                 ch1_apps = self.runtime.get_cloudhub_applications(env.org_id, env.env_id)
@@ -1003,7 +1051,16 @@ class MuleSoftAPIDiscovery:
                         status=app.get("lastReportedStatus", ""),
                         last_update_time=app.get("lastModifiedDate", "")
                     ))
+                
+                # Check if we hit permission errors for this environment
+                errors_after = len(self.client.stats.get("permission_errors", set()))
+                if errors_after > errors_before:
+                    # New permission errors occurred - likely for this environment
+                    if not ch1_apps and not ch2_apps and not hybrid_apps:
+                        access_denied_envs.append(f"{env.env_name} (Runtime)")
+                        logger.warning(f"    ⚠️  Scope not provided for environment: {env.env_name}")
             
+            self.output.access_denied_environments = access_denied_envs
             logger.info(f"  Found {len(self.output.applications)} total applications")
         
         # 4. Get Visualizer graph
@@ -1021,10 +1078,21 @@ class MuleSoftAPIDiscovery:
                 self.output.production_graph = self._parse_visualizer_graph(production_raw)
                 logger.info(f"  Production: {len(self.output.production_graph.nodes)} nodes, {len(self.output.production_graph.edges)} edges")
         
-        # 5. Get Exchange assets
+        # 5. Get Exchange assets from ALL business groups
         if include_exchange:
             logger.info("\n📚 Fetching Exchange assets...")
-            raw_assets = self.exchange.get_all_assets(self.config.org_id)
+            
+            # Build list of all orgs to query
+            all_orgs = []
+            if self.output.master_org:
+                all_orgs.append({"org_id": self.output.master_org.org_id, "org_name": self.output.master_org.org_name})
+            for org in self.output.organizations:
+                if org.org_id != (self.output.master_org.org_id if self.output.master_org else ""):
+                    all_orgs.append({"org_id": org.org_id, "org_name": org.org_name})
+            
+            # Fetch assets from all business groups
+            raw_assets, denied_bgs = self.exchange.get_all_assets_from_all_orgs(all_orgs)
+            self.output.access_denied_business_groups = denied_bgs
             
             if asset_types:
                 raw_assets = [a for a in raw_assets if a.get("type") in asset_types]
@@ -1111,8 +1179,16 @@ class MuleSoftAPIDiscovery:
         
         # 6. Get API Manager instances
         logger.info("\n📋 Fetching API Manager instances...")
+        api_manager_denied_envs = []
         for env in all_environments:
             instances = self.api_manager.get_api_instances(env.org_id, env.env_id)
+            
+            # Check if access was denied (instances is None or empty and we got a permission error)
+            if instances is None:
+                api_manager_denied_envs.append(f"{env.env_name} (API Manager)")
+                logger.warning(f"  ⚠️  Scope not provided for environment: {env.env_name} (API Manager)")
+                continue
+            
             for instance in instances:
                 api_id = str(instance.get("id", ""))
                 policies = self.api_manager.get_api_policies(env.org_id, env.env_id, api_id)
@@ -1130,6 +1206,11 @@ class MuleSoftAPIDiscovery:
                     technology=instance.get("technology", ""),
                     policies=policies
                 ))
+        
+        # Combine access denied lists
+        self.output.access_denied_environments = list(set(
+            self.output.access_denied_environments + api_manager_denied_envs
+        ))
         logger.info(f"  Found {len(self.output.api_instances)} API instances")
         
         # Summary
@@ -1205,8 +1286,30 @@ class MuleSoftAPIDiscovery:
         if self.output.production_graph:
             print(f"  Production Graph: {len(self.output.production_graph.nodes)} nodes, {len(self.output.production_graph.edges)} edges")
         
+        # Print access denied warnings
+        self._print_access_warnings()
+        
         # Data completeness check
         self._print_data_completeness()
+    
+    def _print_access_warnings(self) -> None:
+        """Print warnings about business groups or environments without access."""
+        has_warnings = False
+        
+        if self.output.access_denied_business_groups:
+            has_warnings = True
+            print(f"\n⚠️  Scope not provided in Connected App for Business Groups:")
+            for bg_name in self.output.access_denied_business_groups:
+                print(f"    • {bg_name}")
+        
+        if self.output.access_denied_environments:
+            has_warnings = True
+            print(f"\n⚠️  Scope not provided in Connected App for Environments:")
+            for env_name in sorted(set(self.output.access_denied_environments)):
+                print(f"    • {env_name}")
+        
+        if has_warnings:
+            print(f"\n   To include these, update your Connected App to grant access to these business groups/environments.")
     
     def _print_data_completeness(self) -> None:
         """Print data completeness diagnostics."""
@@ -1284,7 +1387,7 @@ class MuleSoftAPIDiscovery:
         return saved_files
     
     def _build_summary(self) -> Dict:
-        return {
+        summary = {
             "discovery_timestamp": self.output.discovery_timestamp,
             "organization": {
                 "id": self.output.master_org.org_id if self.output.master_org else "",
@@ -1312,6 +1415,15 @@ class MuleSoftAPIDiscovery:
                 for a in self.output.applications
             ]
         }
+        
+        # Include access warnings if any
+        if self.output.access_denied_business_groups or self.output.access_denied_environments:
+            summary["access_warnings"] = {
+                "business_groups_without_scope": self.output.access_denied_business_groups,
+                "environments_without_scope": list(set(self.output.access_denied_environments))
+            }
+        
+        return summary
     
     def _to_dict(self, obj) -> Any:
         if hasattr(obj, '__dataclass_fields__'):
