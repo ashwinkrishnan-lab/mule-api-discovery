@@ -33,6 +33,9 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
+from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,6 +120,9 @@ class RateLimitConfig:
     # Pause between batches of assets
     batch_size: int = 50
     batch_pause: float = 5.0
+    
+    # Number of parallel threads for asset processing (1 = sequential)
+    max_workers: int = 1
 
 
 # =============================================================================
@@ -274,7 +280,7 @@ class DiscoveryOutput:
 # =============================================================================
 
 class AnypointClient:
-    """HTTP client for Anypoint Platform APIs with rate limiting."""
+    """HTTP client for Anypoint Platform APIs with rate limiting and thread safety."""
     
     def __init__(self, config: AnypointConfig, rate_config: RateLimitConfig = None):
         self.config = config
@@ -286,6 +292,9 @@ class AnypointClient:
         self._rate_limit_remaining: Optional[int] = None
         self._rate_limit_reset: Optional[float] = None
         
+        # Thread safety lock for rate limiting
+        self._lock = threading.Lock()
+        
         self.stats = {
             "total_requests": 0,
             "successful_requests": 0,
@@ -296,24 +305,25 @@ class AnypointClient:
         }
     
     def _wait_for_rate_limit(self) -> None:
-        """Wait to respect rate limits."""
-        now = time.time()
-        
-        if self._rate_limit_remaining is not None and self._rate_limit_remaining <= 1:
-            if self._rate_limit_reset and self._rate_limit_reset > now:
-                wait_time = self._rate_limit_reset - now + 0.5
-                logger.info(f"⏳ Rate limit reached. Waiting {wait_time:.1f}s...")
+        """Wait to respect rate limits. Thread-safe."""
+        with self._lock:
+            now = time.time()
+            
+            if self._rate_limit_remaining is not None and self._rate_limit_remaining <= 1:
+                if self._rate_limit_reset and self._rate_limit_reset > now:
+                    wait_time = self._rate_limit_reset - now + 0.5
+                    logger.info(f"⏳ Rate limit reached. Waiting {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                    self.stats["total_wait_time"] += wait_time
+                    now = time.time()
+            
+            elapsed = now - self._last_request_time
+            if elapsed < self.rate_config.request_delay:
+                wait_time = self.rate_config.request_delay - elapsed
                 time.sleep(wait_time)
                 self.stats["total_wait_time"] += wait_time
-                return
-        
-        elapsed = now - self._last_request_time
-        if elapsed < self.rate_config.request_delay:
-            wait_time = self.rate_config.request_delay - elapsed
-            time.sleep(wait_time)
-            self.stats["total_wait_time"] += wait_time
-        
-        self._last_request_time = time.time()
+            
+            self._last_request_time = time.time()
     
     def _update_rate_limit_from_headers(self, response: requests.Response) -> None:
         """Extract rate limit info from response headers."""
@@ -641,7 +651,9 @@ class ExchangeDiscovery:
     
     def _get_page_content(self, group_id: str, asset_id: str, version: str, page_path: str) -> Optional[str]:
         """Fetches the content of a specific documentation page."""
-        url = f"{self.config.exchange_url}/assets/{group_id}/{asset_id}/{version}/pages/{page_path}"
+        # URL-encode the page path to handle special characters (spaces, slashes, etc.)
+        encoded_path = quote(page_path, safe='')
+        url = f"{self.config.exchange_url}/assets/{group_id}/{asset_id}/{version}/pages/{encoded_path}"
         return self.client.get_text(url)
     
     def get_asset_dependencies(self, group_id: str, asset_id: str, version: str) -> Dict:
@@ -688,11 +700,27 @@ class SpecificationParser:
     @staticmethod
     def parse_openapi(spec_content: str) -> Optional[APISpecification]:
         try:
-            if spec_content.strip().startswith('{'):
-                spec = json.loads(spec_content)
+            # Handle empty or whitespace-only content
+            if not spec_content or not spec_content.strip():
+                return None
+            
+            content = spec_content.strip()
+            if content.startswith('{'):
+                spec = json.loads(content)
             else:
-                import yaml
-                spec = yaml.safe_load(spec_content)
+                try:
+                    import yaml
+                    spec = yaml.safe_load(content)
+                except ImportError:
+                    # If yaml not installed, try JSON as fallback
+                    logger.debug("PyYAML not installed, attempting JSON parse")
+                    spec = json.loads(content)
+                except Exception as yaml_err:
+                    logger.debug(f"YAML parse failed: {yaml_err}")
+                    return None
+            
+            if not isinstance(spec, dict):
+                return None
             
             oas_version = "OAS3" if spec.get("openapi", "").startswith("3") else "OAS2"
             endpoints = []
@@ -951,47 +979,81 @@ class MuleSoftAPIDiscovery:
                 logger.info(f"  Filtered to {len(raw_assets)} assets of types: {asset_types}")
             
             total_assets = len(raw_assets)
-            batch_size = self.rate_config.batch_size
+            max_workers = self.rate_config.max_workers
             
             if total_assets > 100:
                 estimated_calls = total_assets * 5
-                estimated_time = estimated_calls / self.rate_config.requests_per_second
-                logger.info(f"  ⏱️  Estimated: {estimated_time/60:.1f} min for {total_assets} assets")
+                # Adjust estimate for parallel execution
+                effective_rps = self.rate_config.requests_per_second * min(max_workers, 3)
+                estimated_time = estimated_calls / effective_rps
+                logger.info(f"  ⏱️  Estimated: {estimated_time/60:.1f} min for {total_assets} assets (workers: {max_workers})")
             
             type_counts: Dict[str, int] = {}
+            type_counts_lock = threading.Lock()
+            processed_count = [0]  # Use list for mutable counter in closure
             
-            for i, raw_asset in enumerate(raw_assets):
+            def process_single_asset(raw_asset: Dict) -> ExchangeAsset:
+                """Process a single asset - can be run in parallel."""
                 asset_type = raw_asset.get("type", "unknown")
-                type_counts[asset_type] = type_counts.get(asset_type, 0) + 1
+                
+                with type_counts_lock:
+                    type_counts[asset_type] = type_counts.get(asset_type, 0) + 1
+                
                 asset = self._build_exchange_asset(raw_asset)
                 
-                if (i + 1) % 10 == 0 or i == len(raw_assets) - 1:
-                    pct = ((i + 1) / total_assets) * 100
-                    logger.info(f"  Processing: {i+1}/{total_assets} ({pct:.0f}%)")
+                try:
+                    details = self.exchange.get_asset_details(asset.group_id, asset.asset_id, asset.version)
+                    if details:
+                        self._enrich_asset_from_details(asset, details)
+                    
+                    if include_specs and asset_type in ['rest-api', 'http-api', 'raml', 'raml-fragment', 'oas']:
+                        spec_content = self.exchange.get_asset_specification(asset.group_id, asset.asset_id, asset.version)
+                        if spec_content:
+                            asset.specification = SpecificationParser.parse(spec_content)
+                    
+                    if include_docs:
+                        asset.documentation_pages = self.exchange.get_asset_documentation(asset.group_id, asset.asset_id, asset.version)
+                    
+                    deps = self.exchange.get_asset_dependencies(asset.group_id, asset.asset_id, asset.version)
+                    asset.dependencies = deps.get("dependencies", [])
+                    asset.dependents = deps.get("dependents", [])
+                    
+                    asset.files = self.exchange.get_asset_files(asset.group_id, asset.asset_id, asset.version)
+                except Exception as e:
+                    logger.warning(f"  ⚠️  Error processing asset {asset.asset_id}: {e}")
                 
-                if (i + 1) % batch_size == 0 and (i + 1) < total_assets:
-                    logger.info(f"  💤 Batch pause ({self.rate_config.batch_pause}s)...")
-                    time.sleep(self.rate_config.batch_pause)
+                with type_counts_lock:
+                    processed_count[0] += 1
+                    if processed_count[0] % 10 == 0 or processed_count[0] == total_assets:
+                        pct = (processed_count[0] / total_assets) * 100
+                        logger.info(f"  Processing: {processed_count[0]}/{total_assets} ({pct:.0f}%)")
                 
-                details = self.exchange.get_asset_details(asset.group_id, asset.asset_id, asset.version)
-                if details:
-                    self._enrich_asset_from_details(asset, details)
-                
-                if include_specs and asset_type in ['rest-api', 'http-api', 'raml', 'raml-fragment', 'oas']:
-                    spec_content = self.exchange.get_asset_specification(asset.group_id, asset.asset_id, asset.version)
-                    if spec_content:
-                        asset.specification = SpecificationParser.parse(spec_content)
-                
-                if include_docs:
-                    asset.documentation_pages = self.exchange.get_asset_documentation(asset.group_id, asset.asset_id, asset.version)
-                
-                deps = self.exchange.get_asset_dependencies(asset.group_id, asset.asset_id, asset.version)
-                asset.dependencies = deps.get("dependencies", [])
-                asset.dependents = deps.get("dependents", [])
-                
-                asset.files = self.exchange.get_asset_files(asset.group_id, asset.asset_id, asset.version)
-                
-                self.output.exchange_assets.append(asset)
+                return asset
+            
+            if max_workers > 1:
+                # Parallel execution using ThreadPoolExecutor
+                logger.info(f"  🚀 Using {max_workers} parallel workers")
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(process_single_asset, raw_asset): raw_asset 
+                              for raw_asset in raw_assets}
+                    
+                    for future in as_completed(futures):
+                        try:
+                            asset = future.result()
+                            self.output.exchange_assets.append(asset)
+                        except Exception as e:
+                            raw_asset = futures[future]
+                            logger.warning(f"  ⚠️  Failed to process asset: {raw_asset.get('assetId', 'unknown')}: {e}")
+            else:
+                # Sequential execution with batch pauses
+                batch_size = self.rate_config.batch_size
+                for i, raw_asset in enumerate(raw_assets):
+                    asset = process_single_asset(raw_asset)
+                    self.output.exchange_assets.append(asset)
+                    
+                    if (i + 1) % batch_size == 0 and (i + 1) < total_assets:
+                        logger.info(f"  💤 Batch pause ({self.rate_config.batch_pause}s)...")
+                        time.sleep(self.rate_config.batch_pause)
             
             self.output.assets_by_type = type_counts
         
@@ -1189,6 +1251,12 @@ Examples:
 
   # Large organization (conservative rate)
   python mule_api_discovery.py ... --rps 2
+
+  # Fast execution with parallel workers (recommended for large orgs)
+  python mule_api_discovery.py ... --workers 4
+
+  # Maximum speed (may hit rate limits)
+  python mule_api_discovery.py ... --workers 5 --rps 10
         """
     )
     
@@ -1206,11 +1274,12 @@ Examples:
     parser.add_argument("--no-runtime", action="store_true", help="Skip Runtime Manager apps")
     parser.add_argument("--asset-types", nargs="+", help="Filter to specific asset types")
     
-    # Rate limiting
+    # Rate limiting and performance
     parser.add_argument("--rps", type=float, default=5.0, help="Requests per second (default: 5)")
     parser.add_argument("--batch-size", type=int, default=50, help="Assets per batch (default: 50)")
     parser.add_argument("--batch-pause", type=float, default=5.0, help="Pause between batches (default: 5s)")
     parser.add_argument("--max-retries", type=int, default=5, help="Max retries on errors (default: 5)")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel workers for asset processing (default: 1). Use 3-5 for faster execution.")
     
     # Output
     parser.add_argument("--output-dir", default="discovery_output", help="Output directory")
@@ -1232,10 +1301,12 @@ Examples:
         requests_per_second=args.rps,
         batch_size=args.batch_size,
         batch_pause=args.batch_pause,
-        max_retries=args.max_retries
+        max_retries=args.max_retries,
+        max_workers=args.workers
     )
     
-    print(f"\n⚡ Rate Limiting: {args.rps} req/sec, batch {args.batch_size}, pause {args.batch_pause}s")
+    workers_info = f", workers: {args.workers}" if args.workers > 1 else ""
+    print(f"\n⚡ Rate Limiting: {args.rps} req/sec, batch {args.batch_size}, pause {args.batch_pause}s{workers_info}")
     
     discovery = MuleSoftAPIDiscovery(config, rate_config)
     
